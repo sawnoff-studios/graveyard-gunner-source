@@ -1,0 +1,48 @@
+name: Update Public Source Repository
+on:
+  push:
+    branches:
+      - master
+env:
+  TARGET_REPO_OWNER: "sawnoff-studios"
+  TARGET_REPO_NAME: "graveyard-gunner-source"
+  TARGET_BRANCH: "master"
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  UpdatePublicSourceRepository:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+          persist-credentials: false
+      - name: Install git-filter-repo
+        run: |
+          sudo apt-get install git-filter-repo
+      - name: Filter repository
+        run: |
+          git-filter-repo --path Content/BloodFX --invert-paths --force
+          git-filter-repo --path Content/Bullet_ImpactFX --invert-paths --force
+          git-filter-repo --path Content/MuzzleFlash3D --invert-paths --force
+          git-filter-repo --path Content/MuzzleFlashVDB --invert-paths --force
+          git-filter-repo --path Content/Necropolis --invert-paths --force
+          git-filter-repo --path Content/PortalFX --invert-paths --force
+          git-filter-repo --path Content/Realistic_Starter_VFX_Pack_Vol2 --invert-paths --force
+          git-filter-repo --path Content/All_In_One_Ammo_Bullet_v1 --invert-paths --force
+          git-filter-repo --path Content/All_In_One_WeaponVerse_v2 --invert-paths --force
+          git-filter-repo --path Content/HealthDamageSFX --invert-paths --force
+          git-filter-repo --path Content/Essential_Foosteps_SK --invert-paths --force
+          git-filter-repo --path Content/Footsteps_Volume_02 --invert-paths --force
+          git-filter-repo --path Content/FootstepsMiniPack --invert-paths --force
+          git-filter-repo --path Content/HumanVocalizations --invert-paths --force
+          git-filter-repo --path Content/Free_Sounds_Pack --invert-paths --force
+          git-filter-repo --path Content/Foley_Long_Gun_Sound_FX_Pack_Vol__1 --invert-paths --force
+      - name: Add remote repository
+        run: |
+          git remote add public-source-repo https://${{ secrets.TARGET_REPO_PAT }}@github.com/${{ env.TARGET_REPO_OWNER }}/${{ env.TARGET_REPO_NAME }}.git
+      - name: Push repository
+        run: |
+          git push public-source-repo --all --force
