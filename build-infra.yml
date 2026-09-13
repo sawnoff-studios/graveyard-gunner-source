@@ -1,0 +1,175 @@
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: ID of the AMI to use for the instance
+    ConstraintDescription: Must be a valid AMI ID in the selected region
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+
+  IamFleetRoleArn:
+    Type: String
+    Description: ARN of the IAM role for the EC2 spot fleet
+
+  IamInstanceProfileArn:
+    Type: String
+    Description: ARN of the IAM instance profile for the EC2 instance
+
+  RunnerTokenLambdaArn:
+    Type: String
+    Description: ARN of the Lambda function to retrieve the runner token
+
+  RunnerGitHubOrganisation:
+    Type: String
+    Description: Organisation name for the GitHub runner
+
+Resources:
+  RunnerSpotFleet:
+    Type: AWS::EC2::SpotFleet
+    DeletionPolicy: Delete
+    Properties:
+      SpotFleetRequestConfigData:
+        Type: request
+        TargetCapacity: 1
+        IamFleetRole: !Ref IamFleetRoleArn
+        TerminateInstancesWithExpiration: true
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref RunnerLaunchTemplate
+              Version: !GetAtt RunnerLaunchTemplate.DefaultVersionNumber
+
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DeletionPolicy: Delete
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !Ref IamInstanceProfileArn
+        KeyName: unreal-engine-server
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time
+            InstanceInterruptionBehavior: terminate
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 250
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            <powershell>
+            
+            # Create runner directory
+            $runnerDir="C:\actions-runner"
+            cd $runnerDir
+            
+            # Invoke GitHub runner token Lambda
+            $payload = "{}"
+            
+            $response = aws lambda invoke `
+              --function-name ${RunnerTokenLambdaArn} `
+              --payload $payload `
+              C:\token.json
+            
+            $tokenObject = Get-Content C:\token.json | ConvertFrom-Json
+            $tokenBody = $tokenObject.body | ConvertFrom-Json
+            $token = $tokenBody.token
+            
+            # Configure GitHub runner
+            .\config.cmd `
+              --unattended `
+              --url ${RunnerGitHubOrganisation} `
+              --token $token `
+              --name unreal-engine-56 `
+              --labels "unreal-engine-56" `
+              --runnergroup "Unreal Engine" `
+              --replace `
+              --runasservice
+            
+            # Update service account
+            $service = (Get-Service actions.runner.*).name
+            
+            Invoke-Command -ScriptBlock {& sc.exe config $service obj= "NT AUTHORITY\SYSTEM" type= own }
+            
+            # Create shutdown script
+            $scriptPath = 'C:\Scripts\Remove-GitHubRunner.ps1'
+            
+            New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null
+            
+            @'
+            $ErrorActionPreference = "Continue"
+            
+            "Running shutdown script..." | Out-File -FilePath C:\Remove-GitHubRunner.txt
+            
+            $tokenObject = Get-Content C:\token.json | ConvertFrom-Json
+            $tokenBody = $tokenObject.body | ConvertFrom-Json
+            $token = $tokenBody.token
+            
+            C:\actions-runner\config.cmd remove --token $token
+            
+            "Finished running shutdown script..." | Out-File -FilePath C:\Remove-GitHubRunner.txt -Append
+            '@ | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+            
+            # Copy to Group Policy directory
+            # With help from https://stackoverflow.com/questions/79837954/how-to-enable-shutdown-powershell-script-on-windows-2022-without-using-gui
+            $gpFolder = "C:\Windows\System32\GroupPolicy"
+            $gpShutdownFolder = "$gpFolder\Machine\Scripts\Shutdown"
+            $null = New-Item -ItemType Directory -Force -Path $gpShutdownFolder
+            Copy-Item -Path $scriptPath -Destination $gpShutdownFolder -Force
+            
+            # Create gpt.ini file
+            @"
+            [General]
+            gPCMachineExtensionNames=[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}] 
+            Version=1
+            "@ | Out-File -FilePath "$gpFolder\gpt.ini" -Encoding utf8
+            
+            # Create psscripts.ini file
+            @"
+            [Shutdown]
+            0CmdLine=Remove-GitHubRunner.ps1
+            0Parameters=
+            "@ | Out-File -FilePath "$gpFolder\Machine\Scripts\psscripts.ini" -Encoding Unicode
+            
+            # Config registry key
+            $configKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Shutdown\0"
+            New-Item -Path "$configKey\0" -Force | Out-Null
+            
+            # Set required registry values — these match what gpedit.msc writes
+            New-ItemProperty -Force -Path $configKey -Name "DisplayName" -Value "Local Group Policy"
+            New-ItemProperty -Force -Path $configKey -Name "FileSysPath" -Value "C:\Windows\System32\GroupPolicy\Machine"
+            New-ItemProperty -Force -Path $configKey -Name "GPO-ID" -Value "LocalGPO"
+            New-ItemProperty -Force -Path $configKey -Name "GPOName" -Value "Local Group Policy"
+            New-ItemProperty -Force -Path $configKey -Name "PSScriptOrder" -PropertyType DWord -Value 1
+            New-ItemProperty -Force -Path $configKey -Name "SOM-ID" -Value "Local"
+            
+            New-ItemProperty -Force -Path "$configKey\0" -Name "Script" -Value Remove-GitHubRunner.ps1
+            New-ItemProperty -Force -Path "$configKey\0" -Name "Parameters" -Value ""
+            New-ItemProperty -Force -Path "$configKey\0" -Name "IsPowershell" -PropertyType DWord -Value 1
+            New-ItemProperty -Force -Path "$configKey\0" -Name "ExecTime" -PropertyType QWord -Value 0
+            
+            # State registry key
+            $stateKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine\Scripts\Shutdown\0"
+            New-Item -Path "$stateKey\0" -Force | Out-Null
+            
+            # Set required registry values — these match what gpedit.msc writes
+            New-ItemProperty -Force -Path $stateKey -Name "DisplayName" -Value "Local Group Policy"
+            New-ItemProperty -Force -Path $stateKey -Name "FileSysPath" -Value "C:\Windows\System32\GroupPolicy\Machine"
+            New-ItemProperty -Force -Path $stateKey -Name "GPO-ID" -Value "LocalGPO"
+            New-ItemProperty -Force -Path $stateKey -Name "GPOName" -Value "Local Group Policy"
+            New-ItemProperty -Force -Path $stateKey -Name "PSScriptOrder" -PropertyType DWord -Value 1
+            New-ItemProperty -Force -Path $stateKey -Name "SOM-ID" -Value "Local"
+            
+            New-ItemProperty -Force -Path "$stateKey\0" -Name "Script" -Value Remove-GitHubRunner.ps1
+            New-ItemProperty -Force -Path "$stateKey\0" -Name "Parameters" -Value ""
+            New-ItemProperty -Force -Path "$stateKey\0" -Name "IsPowerShell" -PropertyType DWord -Value 1
+            New-ItemProperty -Force -Path "$stateKey\0" -Name "ExecTime" -PropertyType QWord -Value 0
+            
+            gpupdate /force
+            
+            </powershell>
